@@ -353,6 +353,14 @@ class SessionStateResponse(BaseModel):
     version: dict[str, int]
     conflicts: list[Conflict]
     tombstones: list[str]
+    archived: bool = Field(
+        default=False,
+        description=(
+            "true once the session has been finalized with POST .../archive; "
+            "an archived session is immutable and rejects every batch and "
+            "JSONPath replacement with 409"
+        ),
+    )
     protected_paths: list[str] = Field(
         description=(
             "the protected JSON Pointers pinned at creation (empty for "
@@ -410,6 +418,46 @@ class ReplaceResponse(BaseModel):
     operations: list[ReplaceOperationId] = Field(
         description="the generated set operations, in the same order"
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /sessions/{id}/archive -- finalize an offline-edited session
+# ---------------------------------------------------------------------------
+
+
+class ArchiveRequest(BaseModel):
+    """Body of POST /sessions/{id}/archive: the optimistic-concurrency guard.
+
+    ``expected_revision`` must equal the session's current revision; sealing
+    an archived session re-checked with the archived revision is an
+    idempotent success, while a stale revision yields ``409``.  Archiving
+    never bumps the revision, appends no log entry and writes no history
+    boundary or change event.
+    """
+
+    expected_revision: int = Field(ge=0)
+
+
+class ArchiveResponse(BaseModel):
+    """The immutable final result of an archived session.
+
+    Every field is the ordinary merge result recomputed from the initial
+    document over the whole cumulative log at archive time, persisted with
+    the record: later reads (including after a restart, from another
+    process sharing the store directory) serve exactly these values.
+    """
+
+    session_id: str
+    revision: int = Field(
+        description="the session's revision; archiving does not increment it"
+    )
+    archived: bool = Field(
+        description="always true on a successful archive response"
+    )
+    document: Any = None
+    version: dict[str, int]
+    conflicts: list[Conflict]
+    tombstones: list[str]
 
 
 # ---------------------------------------------------------------------------

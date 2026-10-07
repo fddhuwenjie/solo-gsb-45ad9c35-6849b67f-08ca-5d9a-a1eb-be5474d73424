@@ -71,6 +71,25 @@ location with its current value still stores the operation and bumps
 the revision, and exact retransmissions and zero-hit replacements keep
 their no-op behavior; the stale-revision check (409) runs first.
 
+A session can be **archived** (``archive_session``,
+``POST /sessions/{id}/archive``) once its offline edits are final.  The
+seal re-reads the record and checks ``expected_revision`` inside the
+same cross-process locked section as commits, computes the ordinary
+merge result (document, version, conflicts, tombstones) and persists
+that result together with the ``archived`` flag in one atomic write.
+Archiving adds no operation, no revision and no history boundary, so it
+produces no change-event revision and existing cursors keep working;
+``GET /sessions/{id}`` shows ``archived`` and serves the frozen result.
+Sealing an already-archived session at its current revision is
+idempotent (the stored result is returned verbatim); a stale revision
+conflicts.  After a successful seal every batch and JSONPath
+replacement -- including exact retransmissions and zero-hit queries,
+and before any validation -- is rejected with
+``SessionArchivedError`` (HTTP 409) without touching the document, log
+or history.  If another process commits first, a stale seal gets the
+409; if the seal lands first, the other process's write gets the 409.
+Records written before archiving existed read the flag as false.
+
 Sessions are persisted as one JSON file per session inside a directory
 (``SESSION_STORE_DIR`` env var, default ``.sessions``), so they remain
 readable after the service (or ``docker compose``) restarts.  The lock
@@ -121,6 +140,14 @@ class SessionNotFoundError(KeyError):
 
 class RevisionConflictError(RuntimeError):
     """Raised when the expected revision does not match the current one."""
+
+
+class SessionArchivedError(RevisionConflictError):
+    """Raised when a write is attempted on an archived (finalized) session.
+
+    Subclasses :class:`RevisionConflictError` so it surfaces as ``409`` at
+    the HTTP layer just like a stale expected revision.
+    """
 
 
 class CursorOutOfRangeError(ValueError):
@@ -327,6 +354,13 @@ class SessionRecord:
     record.  ``protected_paths`` is the immutable protected-pointer rule
     pinned at creation; records written before that feature existed have
     none and read back as an empty rule.
+
+    ``archived`` marks a finalized session.  The seal is stored together
+    with the merge result computed at seal time (``archive_state``):
+    document, version, conflicts and tombstones, served verbatim by every
+    later read.  Archiving adds neither a log entry nor a revision; once
+    set, the record never changes again.  Records written before archiving
+    existed read ``archived`` as false and carry no snapshot.
     """
 
     session_id: str
@@ -336,6 +370,8 @@ class SessionRecord:
     log: list[Operation] = field(default_factory=list)
     history: list[_Boundary] | None = None
     protected_paths: list[str] = field(default_factory=list)
+    archived: bool = False
+    archive_state: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -355,6 +391,15 @@ class SessionRecord:
             # process (and a second process sharing the directory) observes
             # the same empty rule rather than guessing from its absence.
             "protected_paths": list(self.protected_paths),
+            # Same rationale as protected_paths: the seal state is written
+            # explicitly, and an un-archived session persists ``false`` so
+            # every process sharing the directory agrees it is still open.
+            "archived": self.archived,
+            **(
+                {"archive": deepcopy(self.archive_state)}
+                if self.archive_state is not None
+                else {}
+            ),
         }
 
     @classmethod
@@ -369,6 +414,9 @@ class SessionRecord:
         # rule -- every commit keeps working exactly as before.
         raw_protected = data.get("protected_paths", [])
         protected_paths = list(raw_protected) if raw_protected else []
+        # Records written before archiving existed are open by default.
+        archived = bool(data.get("archived", False))
+        archive_state = data.get("archive", None) if archived else None
         return cls(
             session_id=data["session_id"],
             revision=int(data["revision"]),
@@ -377,6 +425,8 @@ class SessionRecord:
             log=[Operation.model_validate(o) for o in data["log"]],
             history=history,
             protected_paths=protected_paths,
+            archived=archived,
+            archive_state=archive_state,
         )
 
 
@@ -480,6 +530,17 @@ class SessionStore:
         """The current merged document, recomputed from the initial document."""
         return merge_logs(rec.document, rec.version, [rec.log])["document"]
 
+    @staticmethod
+    def _freeze_state(rec: SessionRecord) -> dict[str, Any]:
+        """Compute the merge result that an archive freezes for the record."""
+        result = merge_logs(rec.document, rec.version, [rec.log])
+        return {
+            "document": result["document"],
+            "version": result["version"],
+            "conflicts": result["conflicts"],
+            "tombstones": result["tombstones"],
+        }
+
     def _seed_history(self, rec: SessionRecord) -> bool:
         """Seed boundary history for a legacy record; return whether seeded.
 
@@ -539,6 +600,20 @@ class SessionStore:
             rec = self._load(session_id)
         if rec is None:
             raise SessionNotFoundError(session_id)
+        # An archived session is final: serve the merge result frozen at
+        # seal time rather than recomputing (they are identical, since no
+        # log entry can be added afterwards; the snapshot is the guarantee).
+        if rec.archived and rec.archive_state is not None:
+            return {
+                "session_id": rec.session_id,
+                "revision": rec.revision,
+                "document": deepcopy(rec.archive_state["document"]),
+                "version": dict(rec.archive_state["version"]),
+                "conflicts": deepcopy(rec.archive_state["conflicts"]),
+                "tombstones": list(rec.archive_state["tombstones"]),
+                "archived": True,
+                "protected_paths": list(rec.protected_paths),
+            }
         # Reads stay lock-free (the atomic temp-file-plus-rename persist
         # guarantees a coherent file); only a legacy record's first touch
         # enters the cross-process section to seed and persist its origin.
@@ -552,6 +627,7 @@ class SessionStore:
             "version": result["version"],
             "conflicts": result["conflicts"],
             "tombstones": result["tombstones"],
+            "archived": rec.archived,
             "protected_paths": list(rec.protected_paths),
         }
 
@@ -604,6 +680,15 @@ class SessionStore:
             rec = self._load(session_id)
             if rec is None:
                 raise SessionNotFoundError(session_id)
+            if rec.archived:
+                # A finalized session is immutable: retransmissions and
+                # zero-op batches included, and before any validation, so
+                # no archived request can write a log, a boundary or a
+                # legacy-origin migration.
+                raise SessionArchivedError(
+                    f"session {session_id!r} is archived at revision "
+                    f"{rec.revision} and accepts no more batches"
+                )
             if expected_revision != rec.revision:
                 raise RevisionConflictError(
                     f"expected revision {expected_revision} but session "
@@ -690,6 +775,14 @@ class SessionStore:
             rec = self._load(session_id)
             if rec is None:
                 raise SessionNotFoundError(session_id)
+            if rec.archived:
+                # The seal is checked before the revision and before the
+                # query is parsed: zero-hit and retransmitted replacements
+                # are refused as well, and nothing is seeded or written.
+                raise SessionArchivedError(
+                    f"session {session_id!r} is archived at revision "
+                    f"{rec.revision} and accepts no more replacements"
+                )
             if expected_revision != rec.revision:
                 raise RevisionConflictError(
                     f"expected revision {expected_revision} but session "
@@ -772,6 +865,65 @@ class SessionStore:
                     for offset, pointer in enumerate(pointers, start=1)
                 ],
             )
+
+    # -- finalization (archiving) ----------------------------------------
+
+    def archive_session(
+        self, session_id: str, expected_revision: int
+    ) -> dict[str, Any]:
+        """Seal a session at its current revision inside the cross-process lock.
+
+        The record is re-read from disk and the expected revision is
+        checked inside the session's cross-process lock, so sealing is
+        atomic against the concurrent commits and seals of other processes
+        sharing the store directory: a process that commits first makes a
+        stale seal conflict (409), and once the seal is persisted every
+        later batch or replacement is rejected (409).
+
+        The seal persists the merge result current at seal time
+        (document, version vector, conflicts, tombstones) in the same
+        atomic write as the ``archived`` flag.  It bumps no revision,
+        stores no operation, appends no history boundary and therefore
+        generates no change-event revision -- existing revision paging is
+        unchanged.  An already-archived session sealed again at its
+        archived revision is an idempotent success returning the very same
+        frozen result; sealing it at a stale revision still conflicts.
+        """
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SessionNotFoundError(session_id)
+        with self._locked(session_id):
+            rec = self._load(session_id)
+            if rec is None:
+                raise SessionNotFoundError(session_id)
+            if expected_revision != rec.revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision} but session "
+                    f"{session_id!r} is at revision {rec.revision}"
+                )
+            if rec.archived:
+                if rec.archive_state is None:
+                    # Defensive: a record carrying the flag without its
+                    # snapshot (e.g. a hand-edited file) is re-frozen.
+                    rec.archive_state = self._freeze_state(rec)
+                    self._persist(rec)
+            else:
+                # Archiving is a successful access: a legacy record's
+                # history origin is seeded in the same atomic write as the
+                # seal.  The seal itself appends no boundary.
+                self._seed_history(rec)
+                rec.archive_state = self._freeze_state(rec)
+                rec.archived = True
+                self._persist(rec)
+            state = rec.archive_state
+            return {
+                "session_id": rec.session_id,
+                "revision": rec.revision,
+                "archived": True,
+                "document": deepcopy(state["document"]),
+                "version": dict(state["version"]),
+                "conflicts": deepcopy(state["conflicts"]),
+                "tombstones": list(state["tombstones"]),
+            }
 
     # -- incremental revision reads -------------------------------------
 

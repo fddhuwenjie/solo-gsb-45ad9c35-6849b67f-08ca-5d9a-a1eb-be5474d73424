@@ -7,6 +7,8 @@ from fastapi.responses import JSONResponse
 from .engine import LogValidationError, merge_logs
 from .models import (
     ApplyRequest,
+    ArchiveRequest,
+    ArchiveResponse,
     BatchRequest,
     BatchResponse,
     MergeRequest,
@@ -41,7 +43,7 @@ from .sessions import (
 
 app = FastAPI(
     title="Offline JSON Merge API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "Concurrent, offline-first merging of JSON document operation logs "
         "using vector clocks, deterministic (actor, seq) arbitration, "
@@ -53,6 +55,7 @@ app = FastAPI(
         "batched-submission sessions (POST /sessions, "
         "POST /sessions/{session_id}/batches, GET /sessions/{session_id}, "
         "POST /sessions/{session_id}/replace, "
+        "POST /sessions/{session_id}/archive, "
         "POST /sessions/{session_id}/changes) that accumulate operation "
         "batches into one cumulative log re-merged from the initial "
         "document on every commit, and page the per-revision routed "
@@ -60,7 +63,13 @@ app = FastAPI(
         "may pin up to 20 immutable protected JSON Pointers at creation; "
         "any batch or JSONPath replacement whose locked commit would "
         "change one of those locations is rejected (422) without writing "
-        "a log entry, revision or history boundary."
+        "a log entry, revision or history boundary.  A session may be "
+        "archived (POST /sessions/{id}/archive): the seal verifies the "
+        "expected revision inside the cross-process lock, persists the "
+        "current document/version/conflicts/tombstones without bumping "
+        "the revision, and afterwards every batch or replacement "
+        "(including retransmissions and zero-hit requests) is rejected "
+        "with 409."
     ),
 )
 
@@ -256,6 +265,32 @@ def replace_by_path(
             for actor, seq, path in outcome.operations
         ],
     }
+
+
+@app.post(
+    "/sessions/{session_id}/archive",
+    response_model=ArchiveResponse,
+)
+def archive_session(session_id: str, req: ArchiveRequest, request: Request) -> dict:
+    """Finalize a session: seal its current merge result without a new revision.
+
+    The expected revision is verified inside the session's cross-process
+    lock; the computed document, version, conflicts and tombstones are
+    persisted with the seal and returned.  Archiving appends no
+    operation, boundary or change event.  A re-seal at the archived
+    revision returns the same frozen result; a stale revision is a 409,
+    as is every batch or replacement against an already-archived session.
+    """
+    try:
+        return _session_store(request).archive_session(
+            session_id, req.expected_revision
+        )
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+    except RevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post(
