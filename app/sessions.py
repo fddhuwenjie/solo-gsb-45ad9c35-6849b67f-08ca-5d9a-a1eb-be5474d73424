@@ -71,6 +71,34 @@ location with its current value still stores the operation and bumps
 the revision, and exact retransmissions and zero-hit replacements keep
 their no-op behavior; the stale-revision check (409) runs first.
 
+A finished session can be **sealed** (``POST
+/sessions/{id}/seal``).  Sealing runs inside the same cross-process
+critical section as a commit: the record is re-read from disk, the
+caller's ``expected_revision`` is checked against the current revision,
+and the currently recomputed document, version vector, conflicts and
+tombstones are returned together with ``sealed: true``.  Sealing adds
+no operation, does not bump the revision, appends no history boundary
+and produces no log entry or change event -- the only state it persists
+is the durable ``sealed`` flag (a legacy record's history origin is
+seeded in the same write, exactly as an ordinary no-op access would).
+Repeating a seal at the same revision is idempotent (``200``); a stale
+expected revision is a ``RevisionConflictError`` (HTTP 409).
+
+Once a session is sealed every mutating request is rejected with
+``RevisionConflictError`` (HTTP 409) *before* the ordinary revision
+check, validation or JSONPath selection: batch commits (exact
+retransmissions included) and JSONPath replacements (zero-hit queries
+included) can never change the document, log or history of a sealed
+session.  Because both the seal and the writes take the same per-session
+``flock`` and re-read the record inside it, a write committed by another
+process first turns a still-current seal attempt into a ``409`` (the
+revision moved), and a seal completed first turns the other process's
+in-flight write into a ``409`` (the record is sealed).  Reads keep
+working unchanged: ``GET /sessions/{id}`` reports the ``sealed`` flag
+and existing revisions stay available through the incremental
+``.../changes`` read.  Records written before the feature existed read
+``sealed`` as false.
+
 Sessions are persisted as one JSON file per session inside a directory
 (``SESSION_STORE_DIR`` env var, default ``.sessions``), so they remain
 readable after the service (or ``docker compose``) restarts.  The lock
@@ -121,6 +149,14 @@ class SessionNotFoundError(KeyError):
 
 class RevisionConflictError(RuntimeError):
     """Raised when the expected revision does not match the current one."""
+
+
+class SessionSealedError(RevisionConflictError):
+    """Raised when a write is attempted against a sealed (archived) session.
+
+    Subclasses :class:`RevisionConflictError` so the HTTP layer answers
+    ``409`` with the same conflict semantics as a stale revision.
+    """
 
 
 class CursorOutOfRangeError(ValueError):
@@ -326,7 +362,9 @@ class SessionRecord:
     feature existed.  ``history is None`` marks a not-yet-migrated legacy
     record.  ``protected_paths`` is the immutable protected-pointer rule
     pinned at creation; records written before that feature existed have
-    none and read back as an empty rule.
+    none and read back as an empty rule.  ``sealed`` is the durable
+    archive flag: once true no mutating request is ever accepted again;
+    records written before sealing existed read back as false.
     """
 
     session_id: str
@@ -336,6 +374,7 @@ class SessionRecord:
     log: list[Operation] = field(default_factory=list)
     history: list[_Boundary] | None = None
     protected_paths: list[str] = field(default_factory=list)
+    sealed: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -355,6 +394,11 @@ class SessionRecord:
             # process (and a second process sharing the directory) observes
             # the same empty rule rather than guessing from its absence.
             "protected_paths": list(self.protected_paths),
+            # The seal is written explicitly (even when false) for the same
+            # reason: every process must agree that a record it wrote is
+            # unsealed; only genuinely old records omit the key and read
+            # back as false.
+            "sealed": bool(self.sealed),
         }
 
     @classmethod
@@ -369,6 +413,8 @@ class SessionRecord:
         # rule -- every commit keeps working exactly as before.
         raw_protected = data.get("protected_paths", [])
         protected_paths = list(raw_protected) if raw_protected else []
+        # Records written before sealing existed default to unsealed.
+        sealed = bool(data.get("sealed", False))
         return cls(
             session_id=data["session_id"],
             revision=int(data["revision"]),
@@ -377,6 +423,7 @@ class SessionRecord:
             log=[Operation.model_validate(o) for o in data["log"]],
             history=history,
             protected_paths=protected_paths,
+            sealed=sealed,
         )
 
 
@@ -544,6 +591,11 @@ class SessionStore:
         # enters the cross-process section to seed and persist its origin.
         if rec.history is None:
             rec = self._migrate_legacy(session_id)
+        return self._state_from_record(rec)
+
+    @staticmethod
+    def _state_from_record(rec: SessionRecord) -> dict[str, Any]:
+        """Build the public session-state payload from a loaded record."""
         result = merge_logs(rec.document, rec.version, [rec.log])
         return {
             "session_id": rec.session_id,
@@ -553,7 +605,49 @@ class SessionStore:
             "conflicts": result["conflicts"],
             "tombstones": result["tombstones"],
             "protected_paths": list(rec.protected_paths),
+            "sealed": bool(rec.sealed),
         }
+
+    def seal(
+        self, session_id: str, expected_revision: int
+    ) -> dict[str, Any]:
+        """Seal (archive) a finished session inside the commit critical section.
+
+        The record is re-read from disk under the session's in-process lock
+        and cross-process ``flock``; the caller's ``expected_revision`` is
+        then checked against the current revision exactly as for a commit.
+        Sealing stores no operation, bumps no revision, appends no history
+        boundary and emits no event -- the only persisted change is the
+        durable ``sealed`` flag (together with a legacy record's seeded
+        history origin).  The returned payload is the recomputed state at
+        that unchanged revision, with ``sealed: true``.
+
+        Sealing an already sealed session at its current revision is
+        idempotent and returns ``200`` without writing again; a stale
+        expected revision raises ``RevisionConflictError`` (HTTP 409), so
+        another process committing first wins and the stale seal loses.
+        """
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SessionNotFoundError(session_id)
+        with self._locked(session_id):
+            rec = self._load(session_id)
+            if rec is None:
+                raise SessionNotFoundError(session_id)
+            if expected_revision != rec.revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision} but session "
+                    f"{session_id!r} is at revision {rec.revision}"
+                )
+            if not rec.sealed:
+                # A legacy record's origin is seeded in the same atomic
+                # write, exactly as a no-op access would do; nothing else
+                # about the history changes.
+                self._seed_history(rec)
+                rec.sealed = True
+                self._persist(rec)
+            state = self._state_from_record(rec)
+            assert state["sealed"] is True
+            return state
 
     def _migrate_legacy(self, session_id: str) -> SessionRecord:
         """Re-load and seed a pre-upgrade record's history origin under lock.
@@ -597,6 +691,11 @@ class SessionStore:
         the would-be document are compared inside the same section; a
         difference rejects the whole batch (422) before any mutation or
         persist step.
+
+        A sealed session rejects every batch (an exact retransmission
+        included) with ``SessionSealedError`` (HTTP 409) before the
+        revision check or validation, leaving document, log and history
+        exactly as they were at sealing time.
         """
         if not _SESSION_ID_RE.fullmatch(session_id):
             raise SessionNotFoundError(session_id)
@@ -604,6 +703,15 @@ class SessionStore:
             rec = self._load(session_id)
             if rec is None:
                 raise SessionNotFoundError(session_id)
+            # A sealed session is final: every batch -- exact
+            # retransmission included -- is a 409 before the revision
+            # check, validation or any merge, so document, log and
+            # history stay untouched.
+            if rec.sealed:
+                raise SessionSealedError(
+                    f"session {session_id!r} is sealed at revision "
+                    f"{rec.revision}; no further batches are accepted"
+                )
             if expected_revision != rec.revision:
                 raise RevisionConflictError(
                     f"expected revision {expected_revision} but session "
@@ -669,7 +777,9 @@ class SessionStore:
         ``REPLACE_MATCH_LIMIT`` matches are taken (more rejects the whole
         request) and no two matches may be in a parent/child relationship;
         a zero-hit query is a success that adds no operation, revision or
-        history boundary.
+        history boundary -- unless the session is sealed, in which case
+        even a zero-hit query is rejected with ``SessionSealedError``
+        (HTTP 409) before the path is evaluated.
 
         Otherwise the matches, in document pre-order, become one
         contiguous run of ``set`` operations for ``actor``.  Their version
@@ -690,6 +800,14 @@ class SessionStore:
             rec = self._load(session_id)
             if rec is None:
                 raise SessionNotFoundError(session_id)
+            # Sealed sessions reject every replacement -- including a
+            # zero-hit query -- with 409 before the revision check or any
+            # JSONPath evaluation, so nothing can be written or logged.
+            if rec.sealed:
+                raise SessionSealedError(
+                    f"session {session_id!r} is sealed at revision "
+                    f"{rec.revision}; no further replacements are accepted"
+                )
             if expected_revision != rec.revision:
                 raise RevisionConflictError(
                     f"expected revision {expected_revision} but session "

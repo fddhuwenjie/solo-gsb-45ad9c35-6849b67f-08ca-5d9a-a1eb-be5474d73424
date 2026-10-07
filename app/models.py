@@ -359,6 +359,30 @@ class SessionStateResponse(BaseModel):
             "sessions created before this feature)"
         )
     )
+    sealed: bool = Field(
+        description=(
+            "true once the session has been archived with POST "
+            "/sessions/{id}/seal; a sealed session rejects every batch "
+            "and JSONPath replacement with 409 (false for sessions "
+            "created before this feature)"
+        )
+    )
+
+
+class SealRequest(BaseModel):
+    """Body of POST /sessions/{id}/seal: the optimistic-concurrency guard.
+
+    ``expected_revision`` must equal the session's current revision.
+    Sealing does not bump the revision, add any operation/history
+    boundary or emit change events; it only persists the immutable
+    ``sealed`` flag and returns the recomputed state at that revision.
+    """
+
+    expected_revision: int = Field(ge=0)
+
+
+class SealResponse(SessionStateResponse):
+    """Result of a successful seal: the frozen state, always ``sealed``."""
 
 
 # ---------------------------------------------------------------------------

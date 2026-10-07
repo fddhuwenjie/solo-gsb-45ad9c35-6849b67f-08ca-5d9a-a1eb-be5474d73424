@@ -22,6 +22,8 @@ from .models import (
     RevisionChangesResponse,
     RouteChangesRequest,
     RouteChangesResult,
+    SealRequest,
+    SealResponse,
     SessionCreateRequest,
     SessionCreateResponse,
     SessionStateResponse,
@@ -36,12 +38,13 @@ from .sessions import (
     ReplaceValidationError,
     RevisionConflictError,
     SessionNotFoundError,
+    SessionSealedError,
     SessionStore,
 )
 
 app = FastAPI(
     title="Offline JSON Merge API",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "Concurrent, offline-first merging of JSON document operation logs "
         "using vector clocks, deterministic (actor, seq) arbitration, "
@@ -60,7 +63,13 @@ app = FastAPI(
         "may pin up to 20 immutable protected JSON Pointers at creation; "
         "any batch or JSONPath replacement whose locked commit would "
         "change one of those locations is rejected (422) without writing "
-        "a log entry, revision or history boundary."
+        "a log entry, revision or history boundary.  A finished session "
+        "can be archived (POST /sessions/{session_id}/seal): sealing "
+        "bumps no revision and writes no log entry or change event, but "
+        "from then on every batch or JSONPath replacement -- exact "
+        "retransmissions and zero-hit queries included -- is rejected "
+        "with 409, while reads and existing-revision change paging keep "
+        "working."
     ),
 )
 
@@ -186,6 +195,30 @@ def get_session(session_id: str, request: Request) -> dict:
         ) from exc
 
 
+@app.post("/sessions/{session_id}/seal", response_model=SealResponse)
+def seal_session(session_id: str, req: SealRequest, request: Request) -> dict:
+    """Archive a finished session at its current revision.
+
+    The expected revision is checked inside the session's existing
+    cross-process lock; sealing stores no operation, does not bump the
+    revision and produces no log entry or change event.  It persists the
+    immutable sealed state and returns the recomputed document, version,
+    conflicts and tombstones.  Afterwards every batch or JSONPath
+    replacement -- even a retransmission or a zero-hit query -- gets a
+    409; reads and existing-revision change paging keep working.
+    Sealing an already sealed session at the same revision is
+    idempotent; a stale revision is a 409, an unknown session a 404.
+    """
+    try:
+        return _session_store(request).seal(session_id, req.expected_revision)
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"session {session_id!r} not found"
+        ) from exc
+    except RevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.post("/sessions/{session_id}/batches", response_model=BatchResponse)
 def submit_batch(session_id: str, req: BatchRequest, request: Request) -> dict:
     """Atomically validate, recompute and commit one operation batch."""
@@ -197,6 +230,10 @@ def submit_batch(session_id: str, req: BatchRequest, request: Request) -> dict:
         raise HTTPException(
             status_code=404, detail=f"session {session_id!r} not found"
         ) from exc
+    except SessionSealedError as exc:
+        # Listed before its RevisionConflictError base class so the
+        # sealed-session message reaches the caller verbatim.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RevisionConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except LogValidationError as exc:
@@ -238,6 +275,10 @@ def replace_by_path(
         raise HTTPException(
             status_code=404, detail=f"session {session_id!r} not found"
         ) from exc
+    except SessionSealedError as exc:
+        # Sealed sessions reject every replacement (zero-hit included)
+        # with 409 before validation; listed before the base class.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RevisionConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (ReplaceValidationError, LogValidationError) as exc:

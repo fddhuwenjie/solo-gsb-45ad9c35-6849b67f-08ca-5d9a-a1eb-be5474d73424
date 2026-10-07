@@ -27,8 +27,11 @@
   修订并落盘）；批次与替换提交都会在持锁提交中比较受保护路径操作前后的值，
   任一路径变化（含缺失与 `null` 互变、布尔与数字互变、祖先整体替换、数组
   插入/删除导致下标位移）整次返回 `422`，不写日志、修订与变更历史；
-  `GET /sessions/{id}` 读取最新修订号、文档、版本向量、冲突、墓碑与受保护
-  路径；`POST /sessions/{id}/changes` 传入已读修订号和 1～100 条订阅，按
+  `GET /sessions/{id}` 读取最新修订号、文档、版本向量、冲突、墓碑、受保护
+  路径与封存状态；`POST /sessions/{id}/seal` 封存定稿：不递增修订、不写
+  日志或变更事件，封存后任何批次提交与 JSONPath 批量替换（含重传与零
+  命中）一律 `409`，读取与既有修订补读照常；
+  `POST /sessions/{id}/changes` 传入已读修订号和 1～100 条订阅，按
   修订顺序增量补读之后最多 20 次已提交修订各自的路由事件，返回下次读取
   游标。每次提交都从初始文档重算累计日志（不把上次结果当作新基线），每次
   提交的文档快照（历史边界）与修订号一同持久化，会话持久化到磁盘卷，重启后
@@ -604,8 +607,13 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   按文档先序为该 actor 生成连续编号的 `set` 操作并按原有合并规则原子提交；
   响应 `{"session_id", "revision", "matched_paths", "operations"}`。
 - `GET /sessions/{session_id}`：读取最新修订号、文档、版本向量、冲突、
-  墓碑与 `protected_paths`（该会话创建时固定的受保护路径，旧会话为
-  `[]`）。
+  墓碑、`protected_paths`（该会话创建时固定的受保护路径，旧会话为
+  `[]`）与 `sealed`（是否已封存，旧会话为 `false`）。
+- `POST /sessions/{session_id}/seal`：离线编辑定稿后的**封存**操作。
+  请求体只带 `expected_revision`；在会话既有的跨进程锁内重新读盘并核对
+  修订，随后持久化不可变的封存状态，并返回当前文档、版本向量、冲突、
+  墓碑与 `sealed: true`。封存**不递增修订号、不写操作日志、不追加历史
+  边界、不产生变更事件**；读取与既有修订的增量补读照常工作。
 - `POST /sessions/{session_id}/changes`：传入 `after_revision`（已读修订号）
   与 1～100 条沿用 `/route-changes` 规则的订阅，按修订顺序返回该游标之后
   最多 20 次已提交修订，每条修订是该修订文档相对**前一修订**文档的路由
@@ -678,6 +686,32 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
 - **并发提交**：同一 `expected_revision` 的并发提交只有一个能成功，
   其余因修订号已推进而收到 `409`——该保证在共用同一 `SESSION_STORE_DIR`
   的多个服务进程之间同样成立（见下文「共享存储目录下的并发调用」）。
+- **封存（定稿）**：所有离线编辑完成后调用
+  `POST /sessions/{id}/seal`（请求体 `{"expected_revision": N}`）封存
+  会话，得到一份**不会再变化**的最终结果：
+  - 封存在会话既有的**同一把跨进程锁**内重新从磁盘读取会话并核对
+    `expected_revision`，然后计算并返回当前文档、版本向量、冲突与墓碑，
+    响应结构与 `GET /sessions/{id}` 相同且 `sealed: true`。封存**不递增
+    修订号、不写操作日志、不追加历史边界、不产生任何变更事件**。
+  - 封存状态随会话文件持久化：`GET /sessions/{id}` 返回 `sealed` 字段；
+    服务重启或多个进程共享目录时结果一致；封存前写出的旧会话文件没有
+    该字段，一律按**未封存**读取并可继续写入。
+  - 封存后，`/batches` 与 `/replace` **一律返回 `409`**——包括整批
+    **重传**和 JSONPath **零命中**请求（它们在未封存会话上本是不递增
+    修订的成功响应），文档、日志与历史都不会改变。对已封存会话，封存
+    检查在锁内先于修订号检查、批次校验与 JSONPath 求值执行，因此哪怕
+    携带过期 `expected_revision` 或本来会被判为 `422` 的操作/查询，
+    结果仍是 `409` 且不落盘任何内容（请求体本身不符合 Pydantic 模型，
+    如缺少字段、空批次，仍在进入会话逻辑前返回 `422`）。
+  - 对当前修订重复封存是**幂等**的（返回 `200`，不重写文件）；
+    `expected_revision` 与当前修订不符（过期或超前）返回 `409`；会话
+    不存在返回 `404`。
+  - 封存与写入的先后在跨进程下同样严格：另一进程先提交、修订号已推进时，
+    按旧修订封存得到 `409`，会话仍未封存；封存先完成时，另一进程的写入
+    （批次或替换）在锁内看到封存标记而得到 `409`。
+  - 封存**不影响读取**：`GET /sessions/{id}` 与
+    `POST /sessions/{id}/changes` 照常返回封存时刻的状态与既有修订的
+    事件，已有修订的增量补读（含重启后续读）不受影响。
 - **持久化**：每个会话以 JSON 文件存于 `SESSION_STORE_DIR`（默认
   `./.sessions`；docker compose 中设为 `/data/sessions`，挂载命名卷
   `session-data`），历史边界随会话同文件保存，`docker compose restart`
@@ -701,6 +735,12 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
   已提交的状态，任一进程都能立即读到成功批次、最新修订号并接续分页。
 - 重传幂等、非法批次 `422`、过期修订号 `409`、会话不存在 `404`、游标
   越界 `422` 的语义与单进程完全一致，失败同样不落盘。
+- 封存复用同一临界区：封存与并发写入的先后按获取 `flock` 的顺序严格
+  决出——先提交的进程会让按旧修订封存的另一方在锁内核到修订号已推进
+  而收到 `409`（会话保持未封存）；先封存的进程会让另一方的写入在锁内
+  读到 `sealed` 标记而收到 `409`（连重传与零命中替换也不例外）。封存
+  标志随会话文件落盘后，任一进程的读取都立即显示 `sealed: true`，
+  重启后继续拒绝写入。
 - 锁文件随会话保留（不删除，避免 unlink/reopen 竞态），数量与会话数
   相同；读取路径仅在需要为升级前会话建立历史起点时持锁落盘，其余时候
   靠原子替换保证不会读到写了一半的文件。
@@ -1004,6 +1044,138 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/$SID/re
 # => 409
 ```
 
+### POST /sessions/{id}/seal —— 封存定稿与写入被拒示例
+
+离线编辑定稿后，凭当前修订号封存会话。封存不推进修订号、不写日志、不
+产生变更事件，只把不可变的封存状态落盘并返回最终的文档、版本、冲突与
+墓碑：
+
+```bash
+# 接着前面的会话（当前修订 2）
+curl -s -X POST localhost:8000/sessions/$SID/seal \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2}'
+```
+
+```json
+{
+  "session_id": "...",
+  "revision": 2,
+  "document": {"title": "bob-title", "items": ["A", "x"], "done": true},
+  "version": {"alice": 2, "bob": 2},
+  "conflicts": [
+    {
+      "path": "/title",
+      "reason": "concurrent writes; deterministic arbitration by (actor, seq)",
+      "winner": {"actor": "bob", "seq": 1, "action": "set", "value": "bob-title"},
+      "losers": [{"actor": "alice", "seq": 1, "action": "set", "value": "alice-title"}]
+    }
+  ],
+  "tombstones": [],
+  "protected_paths": [],
+  "sealed": true
+}
+```
+
+读取会话同样显示封存状态（旧会话默认 `sealed: false`），修订号仍是
+封存时的 2：
+
+```bash
+curl -s localhost:8000/sessions/$SID
+# => {"session_id":"...","revision":2,
+#     "document":{"title":"bob-title","items":["A","x"],"done":true},
+#     ..., "sealed":true}
+```
+
+对当前修订重复封存是幂等的（`200`，文件不会被重写）；按过期或超前的
+修订封存返回 `409`；会话不存在返回 `404`：
+
+```bash
+# 幂等重传
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/$SID/seal \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2}'
+# => 200
+
+# 另一进程已先提交、修订号推进 -> 按旧修订封存得到 409
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/sessions/$SID/seal \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1}'
+# => {"detail":"expected revision 1 but session '...' is at revision 2"}
+# => HTTP 409
+
+# 不存在的会话
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  localhost:8000/sessions/00000000000000000000000000000000/seal \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 0}'
+# => 404
+```
+
+**封存后写入一律被拒**：新批次、整批重传（未封存时本是 `200`）都返回
+`409`，文档、日志、修订与历史均不改变：
+
+```bash
+# 一个全新的批次 -> 409
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2,
+       "operations": [{"actor":"carol","seq":1,"version":{"carol":1},"path":"/z","action":"set","value":1}]}'
+# => {"detail":"session '...' is sealed at revision 2; no further batches are accepted"}
+# => HTTP 409
+
+# 早先批次的精确重传 -> 仍然 409（封存检查先于重传幂等）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2,
+       "operations": [
+         {"actor":"alice","seq":1,"version":{"alice":1},"path":"/title","action":"set","value":"alice-title"},
+         {"actor":"alice","seq":2,"version":{"alice":2},"path":"/items","action":"insert","value":"A","index":0}
+       ]}'
+# => 409
+
+# 过期修订号也不会绕过封存
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/$SID/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 0,
+       "operations": [{"actor":"carol","seq":1,"version":{"carol":1},"path":"/z","action":"set","value":1}]}'
+# => 409
+```
+
+JSONPath 批量替换同样全部 `409`——**包括零命中请求**（未封存时零命中
+本是不递增修订的成功响应）；已封存会话上不会进行任何选词或落盘：
+
+```bash
+# 有命中 -> 409
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/sessions/$SID/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2, "actor": "zoe", "path": "$.title", "value": "final"}'
+# => 409
+
+# 零命中 -> 同样 409
+curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/sessions/$SID/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2, "actor": "zoe", "path": "$.nowhere", "value": null}'
+# => {"detail":"session '...' is sealed at revision 2; no further replacements are accepted"}
+# => HTTP 409
+```
+
+被拒之后再读取，状态与封存时完全一致；既有修订的增量补读也照常可用：
+
+```bash
+curl -s localhost:8000/sessions/$SID        # revision 仍为 2,sealed: true
+
+curl -s -X POST localhost:8000/sessions/$SID/changes \
+  -H 'Content-Type: application/json' \
+  -d '{"after_revision": 2,
+       "subscriptions":[{"subscriber_id":"title-svc","include":["/**"]}]}'
+# => {"session_id":"...","current_revision":2,"after_revision":2,
+#     "next_cursor":2,"has_more":false,"changes":[]}
+```
+
+封存标志保存在会话 JSON 文件中，`docker compose restart`（或多进程共享
+`session-data` 卷）后继续生效：重启后读取仍为 `sealed: true`，任何批次
+或替换依旧 `409`，而用历史 `next_cursor` 补读既有修订不受影响。
+
 ### POST /sessions/{id}/changes —— 按修订号增量补读路由事件
 
 调用方分批提交后，用已读修订号作为游标补读每次实际生效的文档变更。
@@ -1174,7 +1346,7 @@ curl -s -X POST localhost:8000/sessions/$SID/changes \
 app/
   main.py      # FastAPI 路由：POST /merge、POST /apply、POST /route-changes、POST /query、POST /resolve、
                # POST /sessions、POST /sessions/{id}/batches、GET /sessions/{id}、
-               # POST /sessions/{id}/replace、POST /sessions/{id}/changes、GET /healthz
+               # POST /sessions/{id}/seal、POST /sessions/{id}/replace、POST /sessions/{id}/changes、GET /healthz
   models.py    # Pydantic 请求/响应模型
   engine.py    # 合并引擎：向量时钟、校验、因果排序、冲突检测、应用器
   routing.py   # 快照递归 diff、JSON Pointer 通配模式匹配、订阅分发
@@ -1183,6 +1355,7 @@ app/
   sessions.py  # 分批会话：累计日志、不可变历史边界、跨进程原子提交（文件锁内校验+重算+边界+修订）、
                # 受保护 JSON Pointer 规则（创建时持久化、持锁提交前后逐路径比对、变化即 422 不落盘）、
                # JSONPath 批量替换（锁内选词+生成连续 set 操作+同一临界区提交）、
+               # 封存定稿（锁内核修订+落盘 sealed 标志、不增修订不写日志、封存后批次/替换含重传零命中一律 409）、
                # 增量修订补读（每次最多 20 条、游标分页）、旧会话历史起点迁移、JSON 文件持久化
 tests/
   test_api.py              # 22 个 merge/apply 端到端测试
@@ -1195,6 +1368,8 @@ tests/
   test_session_replace.py  # 35 个 JSONPath 批量替换端到端测试（选词、连续编号、父子/超限 422、原子并发、历史）
   test_session_protected.py # 46 个受保护 JSON Pointer 端到端测试（规则校验/持久化、批次与替换拦截、
                             #   缺失/null/类型差异、祖先替换与数组位移、空可见变更仍提交、重启与多进程、旧会话空规则）
+  test_session_sealed.py   # 22 个封存定稿端到端测试（封存结果与幂等、过期 409/404、重传与零命中写入被拒、
+                            #   读取与补读不受影响、重启持久化、旧会话默认未封存、多实例与真实多进程封存/提交竞速）
 conftest.py
 Dockerfile
 docker-compose.yml
